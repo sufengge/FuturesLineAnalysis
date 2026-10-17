@@ -1,0 +1,36 @@
+# Python 编译缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+.env
+.venv/
+venv/
+env/
+build/
+dist/
+*.spec
+*.exe
+
+# PyCharm / IDEA 配置文件（你截图里的 .idea 文件夹全部忽略）
+.idea/
+*.iml
+modules.xml
+vcs.xml
+profiles_settings.xml
+inspectionProfiles/
+
+# 临时截图、程序输出图片
+*.png
+*.jpg
+*.jpeg
+*.bmp
+screenshot_*.png
+
+# 日志
+*.log
+
+# 系统文件
+.DS_Store
+Thumbs.db
