@@ -10,6 +10,7 @@ import cv2
 from PIL import Image, ImageTk
 from utils import capture_desktop, cv2_to_pil, resize_pil_image
 from kline_analyzer import analyze_kline_image
+import price_reader as pr
 
 
 class FuturesAnalysisApp:
@@ -151,7 +152,15 @@ class FuturesAnalysisApp:
 
     def _analysis_task(self):
         try:
-            feat, img_draw = analyze_kline_image(self.img_cv)
+            self.root.after(0, lambda: self.status_var.set("正在读取行情真实数值（OCR）…"))
+            ocr_data = None
+            try:
+                words = pr.ocr_image(self.img_cv, scale=2)
+                ocr_data = pr.parse_ocr(words, self.img_cv.shape[0], self.img_cv.shape[1])
+            except Exception:
+                ocr_data = None
+            self.root.after(0, lambda: self.status_var.set("正在分析：均线 / 成交量 / MACD / 趋势…"))
+            feat, img_draw = analyze_kline_image(self.img_cv, ocr_data)
             self.root.after(0, self.update_screenshot, img_draw)
             self.root.after(0, self._render_result, feat)
             self.root.after(0, lambda: self.status_var.set("分析完成。"))
@@ -206,14 +215,51 @@ class FuturesAnalysisApp:
         lines.append("")
         for r in feat["reasons"]:
             lines.append("  • " + r)
+
+        # 真实数据对照（OCR 读取）
+        ocr = feat.get("ocr")
+        flags = feat.get("ocr_flags") or []
+        if ocr and (ocr.get("ohc", {}).get("close") or ocr.get("support")):
+            lines.append("")
+            lines.append("【真实数据对照（OCR读取）】")
+            ohc = ocr.get("ohc", {})
+            parts = []
+            if ohc.get("close") is not None:
+                parts.append(f"收{ohc['close']:.0f}")
+            if ohc.get("high") is not None:
+                parts.append(f"高{ohc['high']:.0f}")
+            if ohc.get("low") is not None:
+                parts.append(f"低{ohc['low']:.0f}")
+            if ocr.get("pressure") is not None:
+                parts.append(f"压力{ocr['pressure']:.0f}")
+            if ocr.get("support") is not None:
+                parts.append(f"支撑{ocr['support']:.0f}")
+            if parts:
+                lines.append("    价位：" + "  ".join(parts))
+            if ocr.get("ma1") is not None and ocr.get("ma2") is not None:
+                lines.append(f"    均线：MA1={ocr['ma1']:.2f}  MA2={ocr['ma2']:.2f}")
+            if ocr.get("vol") is not None and ocr.get("vol_ma") is not None:
+                lines.append(f"    成交量：{int(ocr['vol'])} / 量MA {int(ocr['vol_ma'])}"
+                             f"（{ocr['vol'] / ocr['vol_ma']:.1f}倍）")
+            if ocr.get("diff") is not None and ocr.get("dea") is not None:
+                lines.append(f"    MACD：DIFF={ocr['diff']:.4f}  DEA={ocr['dea']:.4f}")
+            if flags:
+                lines.append(f"    已用真实数值修正指标：{'、'.join(flags)}")
+
         lines.append("")
         lines.append("【强制决策入场参考】若必须下单：")
         fref = feat["forced"]
-        if fref.get("entry_ref") is not None:
-            lines.append(f"    入场参考：当前K线收盘像素 Y={fref['entry_ref']}（图像像素，非真实价格）")
-        if fref.get("stop_long_ref") is not None and fref["decision"] == "买涨":
+        if fref.get("entry_price") is not None:
+            lines.append(f"    入场参考：约 {fref['entry_price']}（当前收盘价，真实价位）")
+        elif fref.get("entry_ref") is not None:
+            lines.append(f"    入场参考：当前K线收盘像素 Y={fref['entry_ref']}（图像像素，未读到真实价位）")
+        if fref.get("stop_long_price") is not None and fref["decision"] == "买涨":
+            lines.append(f"    止损参考：约 {fref['stop_long_price']}（近期低点下方，真实价位）")
+        if fref.get("stop_short_price") is not None and fref["decision"] == "买跌":
+            lines.append(f"    止损参考：约 {fref['stop_short_price']}（近期高点上方，真实价位）")
+        if fref.get("stop_long_ref") is not None and fref["decision"] == "买涨" and fref.get("stop_long_price") is None:
             lines.append(f"    止损参考：Y={fref['stop_long_ref']}（近期低点下方）")
-        if fref.get("stop_short_ref") is not None and fref["decision"] == "买跌":
+        if fref.get("stop_short_ref") is not None and fref["decision"] == "买跌" and fref.get("stop_short_price") is None:
             lines.append(f"    止损参考：Y={fref['stop_short_ref']}（近期高点上方）")
         lines.append("")
         lines.append("⚠️ 免责声明：本程序为图像识别技术分析，仅供学习研究，不构成任何交易建议。"

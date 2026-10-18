@@ -331,10 +331,38 @@ def analyze_levels(k_list, main_h):
 
 # =============================================================================
 # 7. 最后一根K线：影线 + 十字星形态
+# 有 OCR 真实开/收/高/低时，直接用真实数值在价格层面判定，准确且不标“估算”；
+# 否则退回像素法（标注估算）。
 # =============================================================================
-def analyze_last_shape(main_area, k_list):
+def analyze_last_shape(main_area, k_list, ocr_ohc=None):
     if not k_list:
         return {"shadow_score": 0, "pattern_score": 0, "desc": "无有效K线，形态未识别"}
+
+    # ---- 优先用 OCR 真实 OHLC（价格层面，准确） ----
+    if ocr_ohc and ocr_ohc.get("open") is not None and ocr_ohc.get("close") is not None \
+            and ocr_ohc.get("high") is not None and ocr_ohc.get("low") is not None:
+        o, c = float(ocr_ohc["open"]), float(ocr_ohc["close"])
+        hi, lo = float(ocr_ohc["high"]), float(ocr_ohc["low"])
+        body = abs(c - o)
+        upper = hi - max(o, c)
+        lower = min(o, c) - lo
+        full = hi - lo
+        shadow_score, pattern_score = 0, 0
+        tags = []
+        if body > 0 and upper / body > 2.2:
+            shadow_score = SCORE_WEIGHT["shadow"]
+            tags.append(f"⚠️ 长上影抛压（上影{upper:.1f} / 实体{body:.1f}）")
+        else:
+            tags.append(f"✅ 无长上影压力（上影{upper:.1f} / 实体{body:.1f}）")
+        if body < 0.25 * full and full > 0:
+            pattern_score = SCORE_WEIGHT["pattern"]
+            tags.append("⚠️ 十字星，趋势可能反转")
+        else:
+            tags.append("实体正常")
+        return {"shadow_score": shadow_score, "pattern_score": pattern_score,
+                "desc": "，".join(tags), "src": "ocr"}
+
+    # ---- 兜底：像素法（估算） ----
     last = k_list[-1]
     h_main = main_area.shape[0]
     x0 = max(0, last["cx"] - 3)
@@ -361,29 +389,32 @@ def analyze_last_shape(main_area, k_list):
 
     shadow_score, pattern_score = 0, 0
     tags = []
-    # 长上影：上方影线明显长于实体 → 抛压
     if body > 8 and upper / body > 2.2:
         shadow_score = SCORE_WEIGHT["shadow"]
         tags.append("⚠️ 长上影抛压")
     else:
         tags.append("✅ 无长上影压力")
-    # 十字星：实体极短 → 反转预警
     if body < max(6, h_main * 0.008) and full > body * 3:
         pattern_score = SCORE_WEIGHT["pattern"]
         tags.append("⚠️ 十字星，趋势可能反转")
     else:
         tags.append("实体正常")
     return {"shadow_score": shadow_score, "pattern_score": pattern_score,
-            "desc": "，".join(tags)}
+            "desc": "，".join(tags), "src": "px"}
 
 
 # =============================================================================
 # 8. 连续同向K线
 # =============================================================================
-def analyze_continue(k_list):
+def analyze_continue(k_list, ocr_last_dir=None):
     if not k_list:
         return {"score": 0, "desc": "🟡 未检测到有效K线实体"}
     last_red = k_list[-1]["is_red"]
+    # 用 OCR 真实开/收交叉校验最后一根方向：不符说明像素红蓝识别不稳，直接判定无法可靠统计
+    if ocr_last_dir is not None and ocr_last_dir != last_red:
+        d = "阳线" if ocr_last_dir else "阴线"
+        return {"score": 0,
+                "desc": f"🟡 末根为{d}(OCR真实开收)，但像素红蓝识别与之不符，连续K线无法可靠统计，仅供参考"}
     cnt = 0
     for k in reversed(k_list):
         if k["is_red"] == last_red:
@@ -449,8 +480,12 @@ def build_action(bull_pct, bear_pct):
 
 # =============================================================================
 # 10. 主分析入口：结构化结果
+# ocr_data: 由 price_reader 解析的真实行情值（OHLC/压力支撑/MA/量/MACD），
+#           可用真实数值覆盖易受颜色影响的识别，并把入场/止损定位到具体价格。
 # =============================================================================
-def calc_kline_feature(img_cv):
+def calc_kline_feature(img_cv, ocr_data=None):
+    import price_reader as pr
+
     h_full, w_full = img_cv.shape[:2]
     if h_full <= 10 or w_full <= 10:
         return {"error": "图片尺寸过小，无法识别K线"}
@@ -466,16 +501,53 @@ def calc_kline_feature(img_cv):
     k_red_ratio = round(red_cnt / len(k_list) * 100, 2) if k_list else 0.0
     k_blue_ratio = round(blue_cnt / len(k_list) * 100, 2) if k_list else 0.0
 
-    # ---- 各指标 ----
+    # ---- 各指标（OCR 真实值优先，颜色识别兜底） ----
     ma = analyze_ma(main_area)
     vol = analyze_vol(vol_area)
     macd = analyze_macd(macd_area)
+
+    ocr_flags = []
+    if ocr_data:
+        # 先用 5 倍放大读准 MA1/MA2（带小数的小字整图读不准）
+        ocr_data = pr.enhance_ma(img_cv, ocr_data)
+        m_sig = pr.ocr_ma_signal(ocr_data.get("ma1"), ocr_data.get("ma2"))
+        if m_sig:
+            ma = m_sig
+            ocr_flags.append("MA")
+        v_sig = pr.ocr_vol_signal(ocr_data.get("vol"), ocr_data.get("vol_ma"))
+        if v_sig:
+            vol = v_sig
+            ocr_flags.append("量")
+        c_sig = pr.ocr_macd_signal(ocr_data.get("diff"), ocr_data.get("dea"),
+                                   ocr_data.get("macd"))
+        if c_sig:
+            macd = c_sig
+            ocr_flags.append("MACD")
+
     trend = analyze_trend(ma)
     levels = analyze_levels(k_list, main_area.shape[0])
-    shape = analyze_last_shape(main_area, k_list)
-    cont = analyze_continue(k_list)
+    shape = analyze_last_shape(main_area, k_list, ocr_data.get("ohc") if ocr_data else None)
+    ocr_last_dir = None
+    if ocr_data and ocr_data.get("ohc") \
+            and ocr_data["ohc"].get("open") is not None and ocr_data["ohc"].get("close") is not None:
+        ocr_last_dir = ocr_data["ohc"]["close"] >= ocr_data["ohc"]["open"]
+    cont = analyze_continue(k_list, ocr_last_dir)
 
-    # ---- 止损/入场参考（图像像素，仅供截图定位） ----
+    # ---- 压力/支撑：OCR 真实值补充（替换纯像素估算的说明） ----
+    levels_ocr = None
+    if ocr_data and ocr_data.get("support") is not None and ocr_data.get("ohc", {}).get("close"):
+        sup = ocr_data["support"]
+        pre = ocr_data.get("pressure")
+        close = ocr_data["ohc"]["close"]
+        up_dist = (close - sup) / close * 100 if close else 0
+        sup_note = f"下方支撑{sup:.0f}（当前价距支撑{up_dist:.1f}%）"
+        if pre:
+            pre_note = f"上方压力{pre:.0f}"
+        else:
+            pre_note = "上方压力未识别"
+        levels_ocr = f"真实价位：{pre_note} / {sup_note}；{levels['desc']}"
+
+    # ---- 止损/入场参考（图像像素 + OCR 真实价格） ----
     entry_y = None
     stop_long_y = None
     stop_short_y = None
@@ -490,6 +562,19 @@ def calc_kline_feature(img_cv):
         if price_range > 0:
             stop_long_y = int(recent_low_y + price_range * 0.05)
             stop_short_y = int(recent_high_y - price_range * 0.05)
+
+    # 像素Y → 真实价格映射
+    y2price, price_anchor = pr.build_price_mapper(ocr_data.get("ohc") if ocr_data else None,
+                                                  k_list)
+    entry_price = stop_long_price = stop_short_price = None
+    if y2price:
+        entry_price = y2price(entry_y) if entry_y is not None else None
+        stop_long_price = y2price(stop_long_y) if stop_long_y is not None else None
+        stop_short_price = y2price(stop_short_y) if stop_short_y is not None else None
+    # 用 OCR 当前收盘价作为更准的入场参考
+    ocr_close = ocr_data.get("ohc", {}).get("close") if ocr_data else None
+    if ocr_close is not None:
+        entry_price = float(ocr_close)
 
     # ---- 综合得分 ----
     total_score = (ma["score"] + vol["score"] + macd["score"] + trend["score"]
@@ -507,15 +592,21 @@ def calc_kline_feature(img_cv):
         {"name": "成交量",   "desc": vol["desc"],     "score": vol["score"],  "max": SCORE_WEIGHT["vol"], "tag": ""},
         {"name": "MACD",     "desc": macd["desc"],    "score": macd["score"], "max": SCORE_WEIGHT["macd"], "tag": ""},
         {"name": "趋势动量", "desc": trend["desc"],   "score": trend["score"],"max": SCORE_WEIGHT["trend"], "tag": ""},
-        {"name": "压力支撑", "desc": levels["desc"],  "score": levels["resist_score"] + levels["support_score"], "max": SCORE_WEIGHT["support"], "tag": "估算"},
-        {"name": "影线形态", "desc": shape["desc"],   "score": shape["shadow_score"] + shape["pattern_score"], "max": 0, "tag": "估算"},
+        {"name": "压力支撑", "desc": levels_ocr or levels["desc"],
+         "score": levels["resist_score"] + levels["support_score"], "max": SCORE_WEIGHT["support"],
+         "tag": "" if levels_ocr else "估算"},
+        {"name": "影线形态", "desc": shape["desc"],
+         "score": shape["shadow_score"] + shape["pattern_score"], "max": 0,
+         "tag": "" if shape.get("src") == "ocr" else "估算"},
         {"name": "连续K线",  "desc": cont["desc"],    "score": cont["score"],"max": SCORE_WEIGHT["continue_k"], "tag": "估算"},
-        {"name": "K线多空",  "desc": f"阳线占{k_red_ratio}% / 阴线占{k_blue_ratio}% (识别{len(k_list)}根)", "score": 0, "max": 0, "tag": "估算"},
+        {"name": "K线多空",  "desc": f"像素识别{len(k_list)}根，红/蓝占比{k_red_ratio}%/{k_blue_ratio}%（该软件K线多色渲染，此占比仅供参考，可能与真实不符）", "score": 0, "max": 0, "tag": "估算"},
     ]
 
-    # 数据可信度：主干信号(MA/MACD/量)是否有效
+    # 数据可信度
     reliable_ok = sum(1 for s in [ma.get("data_ok"), macd.get("data_ok"), vol.get("data_ok")] if s)
-    if reliable_ok >= 2:
+    if ocr_flags:
+        data_conf = "较高（关键指标读取真实数值）"
+    elif reliable_ok >= 2:
         data_conf = "较高"
     elif reliable_ok == 1:
         data_conf = "一般"
@@ -547,10 +638,13 @@ def calc_kline_feature(img_cv):
         reasons.append("当前信号矛盾、概率接近，属于低胜率区，建议观望等待。")
     reasons.append("1分钟周期信号变化极快，任何一笔都必须带止损，禁止扛单。")
 
-    # 强制决策的入场/止损/目标（图像像素参考）
+    # 强制决策的入场/止损/目标（价格优先，像素兜底）
     forced["entry_ref"] = entry_y
     forced["stop_long_ref"] = stop_long_y
     forced["stop_short_ref"] = stop_short_y
+    forced["entry_price"] = entry_price
+    forced["stop_long_price"] = stop_long_price
+    forced["stop_short_price"] = stop_short_price
 
     result = {
         "rows": rows,
@@ -566,9 +660,15 @@ def calc_kline_feature(img_cv):
         "entry_y": entry_y,
         "stop_long_y": stop_long_y,
         "stop_short_y": stop_short_y,
+        "entry_price": entry_price,
+        "stop_long_price": stop_long_price,
+        "stop_short_price": stop_short_price,
         "k_red_ratio": k_red_ratio,
         "k_blue_ratio": k_blue_ratio,
         "k_count": len(k_list),
+        "ocr": ocr_data,
+        "ocr_flags": ocr_flags,
+        "price_anchor": price_anchor,
     }
     return result
 
@@ -602,7 +702,7 @@ def draw_mark_image(src_img, feat):
 # =============================================================================
 # 12. 对外统一入口
 # =============================================================================
-def analyze_kline_image(img_cv):
-    feat = calc_kline_feature(img_cv)
+def analyze_kline_image(img_cv, ocr_data=None):
+    feat = calc_kline_feature(img_cv, ocr_data)
     draw_img = draw_mark_image(img_cv, feat)
     return feat, draw_img
