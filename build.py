@@ -1,17 +1,19 @@
+# =============================================================================
+# build.py  自动打包脚本（生成独立 exe）
+# 用法：在项目目录下运行  python build.py
+# 产物：dist/KLineAnalysisTool.exe（单文件、无黑窗口）
+# =============================================================================
 import os
 import shutil
 import subprocess
 
+
 def clean_old_build():
     """清理上次打包生成的 build、dist、spec 文件"""
-    # 要删除的文件夹
-    dirs_to_remove = ["build", "dist"]
-    for d in dirs_to_remove:
+    for d in ["build", "dist"]:
         if os.path.exists(d):
             shutil.rmtree(d)
             print(f"✅ 已删除目录: {d}")
-
-    # 删除 .spec 打包配置文件
     for file in os.listdir("."):
         if file.endswith(".spec"):
             os.remove(file)
@@ -19,22 +21,17 @@ def clean_old_build():
 
 
 def run_pyinstaller():
-    """执行PyInstaller打包命令"""
-    # 打包命令：-F单文件，-w隐藏黑窗口，程序名KLineAnalysisTool，入口main.py
-    cmd = [
-        "pyinstaller",
-        "-F",
-        "-w",
-        "-i", "app.ico",
-        "-n", "KLineAnalysisTool",
-        "main.py"
-    ]
+    """执行PyInstaller打包命令：-F单文件，-w隐藏黑窗口"""
+    cmd = ["pyinstaller", "-F", "-w", "-n", "KLineAnalysisTool", "main.py"]
+    # 若存在图标则加上，避免缺失导致打包失败
+    if os.path.exists("app.ico"):
+        cmd.insert(cmd.index("-n"), "-i")
+        cmd.insert(cmd.index("-n"), "app.ico")
     print("\n🚀 开始执行打包命令：")
     print(" ".join(cmd))
-    # 调用终端执行打包
     result = subprocess.run(cmd, shell=True)
     if result.returncode == 0:
-        print("\n🎉 打包成功！exe文件在 dist/ 文件夹内")
+        print("\n🎉 打包成功！exe文件在 dist/ 文件夹内: dist/KLineAnalysisTool.exe")
     else:
         print("\n❌ 打包失败，请查看上面日志！")
 

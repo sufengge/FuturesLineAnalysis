@@ -1,399 +1,608 @@
+# =============================================================================
+# kline_analyzer.py  核心分析模块
+# 已移除 RSI；升级了均线、成交量、MACD、趋势动量、压力/支撑、影线等算法；
+# 输出结构化结果 dict，供 GUI 以表格形式展示。
+# =============================================================================
 import cv2
 import numpy as np
+from config import (REGION_RATIO, COLOR_HSV, SCORE_WEIGHT, PROB_CONFIG,
+                    DRAW_COLOR, ANALYZE_WIDTH_RATIO)
+from utils import safe_moments, preprocess_mask, split_region_by_ratio, crop_width_ratio
 
 
-def analyze_kline_image(img_cv):
-    img_draw = img_cv.copy()
-    height, width = img_cv.shape[:2]
+# ---------------- 基础掩膜辅助 ----------------
+def _mask_red(hsv):
+    """合并红色HSV区间掩膜（阳线/MACD红柱通用）"""
+    m1 = cv2.inRange(hsv, np.array(COLOR_HSV["k_red"]["low"]), np.array(COLOR_HSV["k_red"]["high"]))
+    m2 = cv2.inRange(hsv, np.array(COLOR_HSV["k_red2"]["low"]), np.array(COLOR_HSV["k_red2"]["high"]))
+    return cv2.bitwise_or(m1, m2)
 
-    # 图片尺寸校验
-    if height <= 10 or width <= 10:
-        return "⚠️图片尺寸过小，无法识别K线", img_draw
 
-    h1 = int(height * 0.52)
-    h2 = int(height * 0.68)
-    h3 = int(height * 0.84)
-    h1 = np.clip(h1, 1, height - 1)
-    h2 = np.clip(h2, h1 + 1, height - 1)
-    h3 = np.clip(h3, h2 + 1, height - 1)
+def _crop(img, top, bottom):
+    """按高度切分 + 左侧宽度裁剪，返回分析区域"""
+    reg = split_region_by_ratio(img, top, bottom)
+    return crop_width_ratio(reg, ANALYZE_WIDTH_RATIO)
 
-    main_area = img_cv[0:h1, :]
-    main_draw_area = img_draw[0:h1, :]
-    vol_area = img_cv[h1:h2, :]
-    macd_area = img_cv[h2:h3, :]
-    rsi_area = img_cv[h3:height, :]
 
-    # ==========1.K线红蓝比例 ==========
-    try:
-        hsv_main = cv2.cvtColor(main_area, cv2.COLOR_BGR2HSV)
-        lower_red1 = np.array([0, 120, 80])
-        upper_red1 = np.array([10, 255, 255])
-        mask_red1 = cv2.inRange(hsv_main, lower_red1, upper_red1)
-        lower_red2 = np.array([170, 120, 80])
-        upper_red2 = np.array([180, 255, 255])
-        mask_red = cv2.bitwise_or(mask_red1, cv2.inRange(hsv_main, lower_red2, upper_red2))
-        red_k_pixel = cv2.countNonZero(mask_red)
+def _col_extent(col_mask, min_px=3):
+    """计算某列有效像素的 (min_y, max_y, height)；像素不足返回 None"""
+    ys = np.where(col_mask > 0)[0]
+    if len(ys) < min_px:
+        return None
+    return int(np.min(ys)), int(np.max(ys)), int(np.max(ys) - np.min(ys))
 
-        lower_blue = np.array([90, 100, 80])
-        upper_blue = np.array([120, 255, 255])
-        mask_blue = cv2.inRange(hsv_main, lower_blue, upper_blue)
-        blue_k_pixel = cv2.countNonZero(mask_blue)
 
-        total_k_pixel = red_k_pixel + blue_k_pixel
-        ratio_red = red_k_pixel / total_k_pixel if total_k_pixel > 0 else 0
-        ratio_blue = blue_k_pixel / total_k_pixel if total_k_pixel > 0 else 0
-    except Exception as e:
-        return f"【K线颜色识别失败】{str(e)}", img_draw
+# =============================================================================
+# 1. K线实体识别（结构优先 + 列密度过滤 + 间距去重）
+# 说明：K线颜色可能与均线相同、且实体有实心/空心之分，纯颜色分割不可靠。
+# 这里以“竖直窄高实体 + 每列彩色像素密度”识别蜡烛体，并按最小间距去重，
+# 结果用于红蓝占比/影线/支撑等补充信号；决策主干以颜色干净的 MA/MACD/量为主。
+# =============================================================================
+def _bar_candidates(mask, is_red):
+    """逐列找主纵向色块，按相邻列合并成候选蜡烛，返回 (cx,top,bot,h,w,density)"""
+    colruns = []
+    for x in range(mask.shape[1]):
+        ys = np.where(mask[:, x] > 0)[0]
+        if len(ys) == 0:
+            continue
+        diff = np.diff(ys)
+        br = np.where(diff > 2)[0]
+        for seg in np.split(ys, br + 1):
+            if len(seg) >= 4:
+                colruns.append((x, int(seg[0]), int(seg[-1])))
+    colruns.sort(key=lambda c: (c[0], c[1]))
+    bars, cur = [], []
+    for r in colruns:
+        if not cur:
+            cur = [r]
+            continue
+        if r[0] - cur[-1][0] <= 3 and not (r[2] < cur[0][1] - 4 or r[1] > cur[0][2] + 4):
+            cur.append(r)
+            continue
+        bars.append(cur)
+        cur = [r]
+    if cur:
+        bars.append(cur)
 
-    # ==========2. MA均线 ==========
-    try:
-        hsv_main = cv2.cvtColor(main_area, cv2.COLOR_BGR2HSV)
-        lower_green_ma = np.array([45, 120, 80])
-        upper_green_ma = np.array([75, 255, 255])
-        mask_ma5 = cv2.inRange(hsv_main, lower_green_ma, upper_green_ma)
-        lower_yellow_ma = np.array([20, 120, 80])
-        upper_yellow_ma = np.array([35, 255, 255])
-        mask_ma20 = cv2.inRange(hsv_main, lower_yellow_ma, upper_yellow_ma)
+    out = []
+    for b in bars:
+        xs = [r[0] for r in b]
+        tops = [r[1] for r in b]
+        bots = [r[2] for r in b]
+        x0, x1 = min(xs), max(xs)
+        top, bot = min(tops), max(bots)
+        w = x1 - x0 + 1
+        hh = bot - top + 1
+        if not (3 <= w <= 45 and hh >= 16):
+            continue
+        # 每列彩色像素密度：均线(细/粗曲线)每列仅1~3px，蜡烛体>=5px
+        density = np.count_nonzero(mask[top:bot + 1, x0:x1 + 1]) / w
+        if density < 5:
+            continue
+        cx = int(sum(r[0] for r in b) / len(b))
+        out.append({"cx": cx, "top": top, "bot": bot, "h": hh, "w": w,
+                    "density": density, "is_red": is_red})
+    return out
 
-        ma_w = mask_ma5.shape[1]
-        w_half = int(ma_w * 0.5)
-        w_half = np.clip(w_half, 0, ma_w - 1)
 
-        ma5_right = mask_ma5[:, w_half:]
-        ma20_right = mask_ma20[:, w_half:]
+def detect_candles(main_area):
+    h_main, w_main = main_area.shape[:2]
+    k_region = main_area[:int(h_main * 0.92), :]
+    hsv = cv2.cvtColor(k_region, cv2.COLOR_BGR2HSV)
+    H, S, V = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    # 红/蓝掩膜（饱和度+亮度，色相放宽以兼容不同行情软件的红蓝K线）
+    mred = ((((H <= 12) | (H >= 168)) & (S >= 60) & (V >= 50)).astype(np.uint8)) * 255
+    mblue = (((H >= 78) & (H <= 165) & (S >= 60) & (V >= 50)).astype(np.uint8)) * 255
 
-        m5 = cv2.moments(ma5_right)
-        m20 = cv2.moments(ma20_right)
-        ma5_y = m5["m01"] / m5["m00"] if m5["m00"] > 0 else None
-        ma20_y = m20["m01"] / m20["m00"] if m20["m00"] > 0 else None
+    cand = _bar_candidates(mred, True) + _bar_candidates(mblue, False)
+    cand.sort(key=lambda c: c["cx"])
 
-        ma_score = 20
-        ma_desc = "⚠️ 均线识别不完整；"
-        ma_bull = False
+    # 间距去重：相邻两候选间隔<=12px视为同一根（或粗均线残留），保留更“实/高”者
+    dedup = []
+    for c in cand:
+        if dedup and c["cx"] - dedup[-1]["cx"] <= 12:
+            p = dedup[-1]
+            if c["h"] * c["density"] > p["h"] * p["density"]:
+                dedup[-1] = c
+            continue
+        dedup.append(c)
 
-        if ma5_y is not None and ma20_y is not None:
-            ma_w2 = mask_ma5.shape[1]
-            w_right = int(ma_w2 * 0.75)
-            w_right = np.clip(w_right, w_half, ma_w2 - 1)
+    k_list = [{"x": c["cx"], "y": c["top"], "h": c["h"], "w": c["w"],
+               "cx": c["cx"], "cy": c["top"] + c["h"] // 2, "is_red": c["is_red"]}
+              for c in dedup]
+    k_list.sort(key=lambda k: k["x"])   # 按时间顺序从左到右
+    return k_list
 
-            ma20_tail = mask_ma20[:, w_right:]
-            m20_tail = cv2.moments(ma20_tail)
-            ma20_tail_y = m20_tail["m01"] / m20_tail["m00"] if m20_tail["m00"] > 0 else None
-            ma20_head = mask_ma20[:, w_half:w_right]
-            m20_head = cv2.moments(ma20_head)
-            ma20_head_y = m20_head["m01"] / m20_head["m00"] if m20_head["m00"] > 0 else None
 
-            if ma5_y < ma20_y:
-                ma_score = 10
-                ma_desc = "❌ MA5在MA20下方，短线死叉；"
-                ma_bull = False
-            else:
-                ma_bull = True
-                if ma20_tail_y is not None and ma20_head_y is not None and ma20_tail_y > ma20_head_y:
-                    ma_score = 28
-                    ma_desc = "🟡 MA5上穿MA20短线金叉，但MA20中期向下，属于下跌趋势反弹金叉；"
-                else:
-                    ma_score = 40
-                    ma_desc = "✅ MA5上穿MA20，MA20向上，趋势反转金叉；"
-    except Exception as e:
-        return f"【均线识别失败】{str(e)}", img_draw
+# =============================================================================
+# 2. 均线分析（MA5 vs MA20 排列 + 斜率）
+# =============================================================================
+def analyze_ma(main_area):
+    h = main_area.shape[0]
+    hsv = cv2.cvtColor(main_area, cv2.COLOR_BGR2HSV)
+    mask_ma5 = preprocess_mask(cv2.inRange(hsv, np.array(COLOR_HSV["ma5_green"]["low"]),
+                                           np.array(COLOR_HSV["ma5_green"]["high"])))
+    mask_ma20 = preprocess_mask(cv2.inRange(hsv, np.array(COLOR_HSV["ma20_yellow"]["low"]),
+                                            np.array(COLOR_HSV["ma20_yellow"]["high"])))
+    w = mask_ma5.shape[1]
+    right_start = int(w * 0.62)          # 右侧38% 为最新区域，屏蔽左侧历史线条
+    m5 = mask_ma5[:, right_start:]
+    m20 = mask_ma20[:, right_start:]
+    wn = m5.shape[1]
 
-    # ==========3. VOL成交量 ==========
-    try:
-        vol_w = vol_area.shape[1]
-        vol_w_split = int(vol_w * 0.75)
-        vol_w_split = np.clip(vol_w_split, 0, vol_w - 1)
-        vol_history_region = vol_area[:, :vol_w_split]
-        vol_right_region = vol_area[:, vol_w_split:]
+    n_win = 4
+    y5_list, y20_list = [], []
+    bulls = 0
+    valid = 0
+    for i in range(n_win):
+        x0 = int(wn * i / n_win)
+        x1 = int(wn * (i + 1) / n_win)
+        win5, win20 = m5[:, x0:x1], m20[:, x0:x1]
+        if cv2.countNonZero(win5) < 14 or cv2.countNonZero(win20) < 14:
+            continue
+        r5 = safe_moments(win5)
+        r20 = safe_moments(win20)
+        if not r5 or not r20:
+            continue
+        valid += 1
+        y5_list.append(r5["cy"])
+        y20_list.append(r20["cy"])
+        bulls += 1 if r5["cy"] < r20["cy"] else 0   # y小=图上靠上=价高 → MA5在MA20上方
 
-        hsv_vol_his = cv2.cvtColor(vol_history_region, cv2.COLOR_BGR2HSV)
-        vol_his_mask = cv2.inRange(hsv_vol_his, np.array([0, 30, 60]), np.array([180, 255, 255]))
-        vol_his_px = cv2.countNonZero(vol_his_mask)
-        avg_his_px = vol_his_px / 45
+    if valid == 0:
+        return {"score": 20, "desc": "⚠️ 均线识别不完整，无法判断排列",
+                "ma_bull": None, "data_ok": False}
 
-        hsv_vol_now = cv2.cvtColor(vol_right_region, cv2.COLOR_BGR2HSV)
-        vol_now_mask = cv2.inRange(hsv_vol_now, np.array([0, 30, 60]), np.array([180, 255, 255]))
-        vol_now_px = cv2.countNonZero(vol_now_mask)
-
-        vol_score = 0
-        vol_desc = ""
-        vol_strong = False
-        if vol_now_px > avg_his_px * 1.35:
-            vol_score = 25
-            vol_desc = "✅ 最新K线成交量放量，资金确认；"
-            vol_strong = True
-        elif vol_now_px > avg_his_px * 0.7:
-            vol_score = 15
-            vol_desc = "🟡 成交量和近期持平；"
-            vol_strong = False
-        else:
-            vol_score = 8
-            vol_desc = "❌ 最新K线成交量萎缩，反弹缺少资金；"
-            vol_strong = False
-    except Exception as e:
-        return f"【成交量识别失败】{str(e)}", img_draw
-
-    # ==========4. MACD ==========
-    try:
-        macd_w = macd_area.shape[1]
-        macd_w_split = int(macd_w * 0.75)
-        macd_w_split = np.clip(macd_w_split, 0, macd_w - 1)
-        macd_right_region = macd_area[:, macd_w_split:]
-        hsv_macd = cv2.cvtColor(macd_right_region, cv2.COLOR_BGR2HSV)
-
-        mask_macd_red1 = cv2.inRange(hsv_macd, np.array([0, 100, 60]), np.array([10, 255, 255]))
-        mask_macd_red2 = cv2.inRange(hsv_macd, np.array([170, 100, 60]), np.array([180, 255, 255]))
-        mask_macd_red = cv2.bitwise_or(mask_macd_red1, mask_macd_red2)
-        macd_red_px = cv2.countNonZero(mask_macd_red)
-        mask_macd_green = cv2.inRange(hsv_macd, np.array([45, 100, 60]), np.array([75, 255, 255]))
-        macd_green_px = cv2.countNonZero(mask_macd_green)
-
-        macd_score = 0
-        macd_desc = ""
-        macd_bull = False
-        h_macd = macd_right_region.shape[0]
-        mid_h = int(h_macd * 0.5)
-        mask_line = cv2.inRange(hsv_macd, np.array([18, 90, 90]), np.array([38, 255, 255]))
-        line_y_sum = 0
-        line_cnt = 0
-        for y in range(h_macd):
-            cnt = np.count_nonzero(mask_line[y, :])
-            if cnt > 0:
-                line_y_sum += y * cnt
-                line_cnt += cnt
-        dif_dea_avg_y = line_y_sum / line_cnt if line_cnt > 0 else None
-        under_zero = False
-        if dif_dea_avg_y is not None:
-            under_zero = dif_dea_avg_y > mid_h
-
-        if macd_red_px > macd_green_px:
-            if under_zero:
-                macd_score = 15
-                macd_desc = "🟡 MACD红柱占优，但DIF/DEA整体在0轴下方，空头环境弱反弹；"
-                macd_bull = False
-            else:
-                macd_score = 35
-                macd_desc = "✅ MACD红柱占优，DIF/DEA位于0轴上方，多头动量；"
-                macd_bull = True
-        else:
-            macd_score = 10
-            macd_desc = "❌ MACD绿柱占优，空头动量；"
-            macd_bull = False
-    except Exception as e:
-        return f"【MACD识别失败】{str(e)}", img_draw
-
-    # ==========5. 压力位、K点、止损线 ==========
-    k_y_array = np.array([])
-    resist_score = 0
-    stop_loss_price_desc = ">⚠️未能识别K线轮廓，无法计算止损像素位置"
-    try:
-        mr_w = main_area.shape[1]
-        cut_pos = int(mr_w * 0.7)
-        cut_pos = np.clip(cut_pos, 0, mr_w - 1)
-        main_right = main_area[:, cut_pos:]
-        hsv_main_r = cv2.cvtColor(main_right, cv2.COLOR_BGR2HSV)
-        mask_kline = cv2.inRange(hsv_main_r, np.array([0, 0, 50]), np.array([180, 255, 255]))
-        k_points = np.where(mask_kline > 0)
-        k_y_array = k_points[0]
-
-        if len(k_y_array) > 0:
-            recent_low_y = np.max(k_y_array)
-            recent_high_y = np.min(k_y_array)
-            cur_y = np.mean(k_y_array)
-            long_stop_y = recent_low_y + (recent_high_y - recent_low_y) * 0.03
-            short_stop_y = recent_high_y - (recent_high_y - recent_low_y) * 0.03
-            stop_loss_price_desc = f">【图像像素参考，仅截图定位用，非真实行情价格】\n>做多止损参考位置：截图纵向像素Y={long_stop_y:.0f}（K线近期低点下方）\n>做空止损参考位置：截图纵向像素Y={short_stop_y:.0f}（K线近期高点上方）"
-
-            if 0 <= long_stop_y < main_draw_area.shape[0]:
-                cv2.line(main_draw_area, (0, int(long_stop_y)), (width, int(long_stop_y)), (0, 0, 255), 2)
-                cv2.putText(main_draw_area, "做多止损", (20, int(long_stop_y) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                            (0, 0, 255), 2)
-            if 0 <= short_stop_y < main_draw_area.shape[0]:
-                cv2.line(main_draw_area, (0, int(short_stop_y)), (width, int(short_stop_y)), (255, 0, 0), 2)
-                cv2.putText(main_draw_area, "做空止损", (20, int(short_stop_y) + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                            (255, 0, 0), 2)
-
-            max_y = np.min(k_y_array)
-            min_y = np.max(k_y_array)
-            cur_price_y = np.mean(k_y_array)
-            price_range = min_y - max_y
-            if price_range > 0 and (cur_price_y - max_y) / price_range < 0.35:
-                resist_score = -12
-    except Exception as e:
-        return f"【K线轮廓识别失败】{str(e)}", img_draw
-
-    # ==========6.影线识别 ==========
-    shadow_score = 0
-    shadow_desc = ""
-    try:
-        kl_w = main_area.shape[1]
-        cut_pos = int(kl_w * 0.8)
-        cut_pos = np.clip(cut_pos, 0, kl_w - 1)
-        k_last_region = main_area[:, cut_pos:]
-        hsv_k_last = cv2.cvtColor(k_last_region, cv2.COLOR_BGR2HSV)
-        mask_k = cv2.inRange(hsv_k_last, np.array([0, 0, 40]), np.array([180, 255, 255]))
-        k_y_pos = np.where(mask_k > 0)[0]
-        if len(k_y_pos) > 0:
-            k_top = np.min(k_y_pos)
-            k_bottom = np.max(k_y_pos)
-            body_h = abs(np.percentile(k_y_pos, 70) - np.percentile(k_y_pos, 30))
-            full_h = k_bottom - k_top
-            if body_h > 0 and full_h / body_h > 2.2:
-                shadow_score = -10
-                shadow_desc = "⚠️ 识别长上影K线，上方抛压较重，扣10分；"
-            else:
-                shadow_desc = "✅ K线无上影压力；"
-        else:
-            shadow_desc = "⚠️ K线影线识别失败"
-    except Exception as e:
-        return f"【影线识别失败】{str(e)}", img_draw
-
-    # ==========7.连续K线 ==========
-    continue_score = 0
-    continue_desc = ""
-    try:
-        seq_w = main_area.shape[1]
-        cut_pos = int(seq_w * 0.75)
-        cut_pos = np.clip(cut_pos, 0, seq_w - 1)
-        seq_region = main_area[:, cut_pos:]
-        hsv_seq = cv2.cvtColor(seq_region, cv2.COLOR_BGR2HSV)
-        mask_red_seq = cv2.inRange(hsv_seq, np.array([0, 100, 60]), np.array([10, 255, 255]))
-        mask_blue_seq = cv2.inRange(hsv_seq, np.array([90, 100, 60]), np.array([120, 255, 255]))
-        red_col_sum = np.count_nonzero(mask_red_seq, axis=0)
-        blue_col_sum = np.count_nonzero(mask_blue_seq, axis=0)
-        cnt_cont_red = 0
-        cnt_cont_blue = 0
-        for col in reversed(range(len(red_col_sum))):
-            if red_col_sum[col] > 10:
-                cnt_cont_red += 1
-            else:
-                break
-        for col in reversed(range(len(blue_col_sum))):
-            if blue_col_sum[col] > 10:
-                cnt_cont_blue += 1
-            else:
-                break
-        if cnt_cont_red >= 3:
-            continue_score += 6
-            continue_desc = f"✅ 连续{cnt_cont_red}根阳线，短线多头延续；"
-        elif cnt_cont_blue >= 3:
-            continue_score -= 6
-            continue_desc = f"❌ 连续{cnt_cont_blue}根阴线，短线空头延续；"
-        else:
-            continue_desc = f"🟡 无连续3根以上K线，连续阳线:{cnt_cont_red}根，连续阴线:{cnt_cont_blue}根；"
-    except Exception as e:
-        return f"【连续K线识别失败】{str(e)}", img_draw
-
-    # ==========8.RSI ==========
-    rsi_score = 0
-    rsi_desc = ""
-    try:
-        h_rsi = rsi_area.shape[0]
-        rsi_mid = int(h_rsi * 0.5)
-        hsv_rsi = cv2.cvtColor(rsi_area, cv2.COLOR_BGR2HSV)
-        mask_rsi_line = cv2.inRange(hsv_rsi, np.array([15, 70, 70]), np.array([40, 255, 255]))
-        rsi_line_y_sum = 0
-        rsi_line_cnt = 0
-        for y in range(h_rsi):
-            c = np.count_nonzero(mask_rsi_line[y, :])
-            if c > 0:
-                rsi_line_y_sum += y * c
-                rsi_line_cnt += c
-        rsi_line_y = rsi_line_y_sum / rsi_line_cnt if rsi_line_cnt > 0 else None
-        if rsi_line_y is not None:
-            ratio_pos = rsi_line_y / h_rsi
-            rsi_val_est = 100 - (ratio_pos * 100)
-            if rsi_val_est >= 80:
-                rsi_score -= 8
-                rsi_desc = f"⚠️ RSI估算{rsi_val_est:.1f}，进入超买区间，多头风险加大，扣8分；"
-            elif rsi_val_est <= 20:
-                rsi_score += 8
-                rsi_desc = f"✅ RSI估算{rsi_val_est:.1f}，进入超卖区间，存在反弹机会，加8分；"
-            else:
-                rsi_desc = f"🟡 RSI估算{rsi_val_est:.1f}，中性区间；"
-        else:
-            rsi_desc = "⚠️ RSI线条识别失败；"
-    except Exception as e:
-        return f"【RSI识别失败】{str(e)}", img_draw
-
-    # =========总分 ==========
-    total_score = ma_score + vol_score + macd_score + resist_score + shadow_score + continue_score + rsi_score
-    total_score = np.clip(total_score, 0, 100)
-    prob_up = np.clip(total_score, 10, 85)
-    prob_down = 100 - prob_up
-    prob_side = 0
-    if 40 <= total_score <= 60:
-        prob_side = 30
-        prob_up = prob_up * 0.7
-        prob_down = prob_down * 0.7
-
-    # ==========操作建议 ==========
-    suggest = ""
-    reason_list = []
-    long_condition = ma_bull and macd_bull and vol_strong and (not under_zero)
-    short_condition = (not ma_bull) and (not macd_bull)
-
-    if long_condition:
-        suggest = "👉【操作建议：买涨（做多）】"
-        reason_list.append(f"1.均线：MA5站上MA20，趋势多头信号({ma_score}/40分)")
-        reason_list.append(f"2.MACD：MACD红柱大于绿柱，DIF/DEA位于0轴上方，上涨动量确认({macd_score}/35分)")
-        reason_list.append(f"3.成交量：最新K线成交量放量，资金进场({vol_score}/25分)")
-        if resist_score < 0:
-            reason_list.append(f"⚠️价格靠近压力位，扣{abs(resist_score)}分，注意承压回落风险")
-        if shadow_score < 0:
-            reason_list.append(f"⚠️长上影抛压，扣{abs(shadow_score)}分")
-        reason_list.append(f"{continue_desc}")
-        reason_list.append(f"{rsi_desc}")
-        reason_list.append(f"综合上涨概率{prob_up:.1f}% > 下跌概率{prob_down:.1f}%，共振多头信号。")
-        reason_list.append("风控：严格设置止损，一旦MA5重新下穿MA20，考虑离场。")
-        reason_list.append(stop_loss_price_desc)
-    elif short_condition:
-        suggest = "👉【操作建议：买跌（做空）】"
-        reason_list.append(f"1.均线：MA5在MA20下方，短线死叉，均线空头信号({ma_score}/40分)")
-        reason_list.append(f"2.MACD：MACD绿柱大于红柱，下跌动量占优({macd_score}/35分)")
-        reason_list.append(f"3.成交量：最新K线成交量放量，资金出逃({vol_score}/25分)")
-        reason_list.append(f"{continue_desc}")
-        reason_list.append(f"{rsi_desc}")
-        reason_list.append(f"综合下跌概率{prob_down:.1f}% > 上涨概率{prob_up:.1f}%，共振空头信号。")
-        reason_list.append("风控：严格设置止损，一旦MA5上穿MA20，考虑离场。")
-        reason_list.append(stop_loss_price_desc)
+    ma5_above = bulls >= 3                          # 多数窗口 MA5 在上
+    # 斜率：cy 增大 = 图上向下 = 价格下跌；末端 cy < 开头 cy = 均线向上
+    slope_th = max(6, int(h * 0.012))
+    ma5_up = (y5_list[0] - y5_list[-1]) > slope_th if len(y5_list) >= 2 else None
+    ma20_up = (y20_list[0] - y20_list[-1]) > slope_th if len(y20_list) >= 2 else None
+    # 趋势倾向（供趋势动量复用，均线斜率比蜡烛位置可靠）
+    if ma20_up and ma5_up:
+        trend_hint = "up"
+    elif ma20_up is False and ma5_up is False:
+        trend_hint = "down"
+    elif ma20_up:
+        trend_hint = "weak_up"
+    elif ma20_up is False:
+        trend_hint = "weak_down"
     else:
-        suggest = "👉【操作建议：观望，不进场】"
-        reason_list.append("数据原因：指标没有形成共振信号，属于单一指标信号，虚假信号概率高。")
-        reason_list.append(
-            f"当前得分{total_score:.0f}/100，上涨概率{prob_up:.1f}%，下跌概率{prob_down:.1f}%，震荡概率{prob_side:.1f}%")
-        reason_list.append(
-            "典型场景：均线金叉但是成交量萎缩/MACD处于0轴下方，属于下跌趋势中的反弹诱多，不建议追涨；反之同理。")
-        reason_list.append("等待三项指标共振后再开仓，提高胜率。")
-        reason_list.append(stop_loss_price_desc)
-    reason_text = "\n".join(reason_list)
+        trend_hint = "flat"
 
-    report = f"""
-==================== K线图像综合分析报告 ====================
-【K线红蓝比例】上涨K线占比：{ratio_red:.2%}，下跌K线占比：{ratio_blue:.2%}
-【MA均线分析】{ma_desc}
-【成交量VOL分析】{vol_desc}
-【MACD指标分析】{macd_desc}
-【压力位评估】{"🟡价格靠近压力区域，扣减" + str(abs(resist_score)) + "分" if resist_score < 0 else "✅价格远离压力位"}
-【K线影线分析】{shadow_desc}
-【连续K线统计】{continue_desc}
-【RSI指标分析】{rsi_desc}
+    if ma5_above:
+        if ma20_up and ma5_up:
+            return {"score": SCORE_WEIGHT["ma"], "desc": "✅ MA5站上MA20且均线向上，多头排列",
+                    "ma_bull": True, "data_ok": True, "trend_hint": trend_hint}
+        elif ma20_up:
+            return {"score": int(SCORE_WEIGHT["ma"] * 0.9), "desc": "✅ MA5上穿MA20，MA20向上，金叉",
+                    "ma_bull": True, "data_ok": True, "trend_hint": trend_hint}
+        else:
+            return {"score": int(SCORE_WEIGHT["ma"] * 0.65), "desc": "🟡 MA5在MA20上方但MA20仍向下，反弹性质谨慎",
+                    "ma_bull": True, "data_ok": True, "trend_hint": trend_hint}
+    else:
+        if ma20_up is False and ma5_up is False:
+            return {"score": 8, "desc": "❌ MA5在MA20下方且均线向下，空头排列",
+                    "ma_bull": False, "data_ok": True, "trend_hint": trend_hint}
+        elif ma20_up is False:
+            return {"score": 12, "desc": "❌ MA5在MA20下方，空头信号",
+                    "ma_bull": False, "data_ok": True, "trend_hint": trend_hint}
+        else:
+            return {"score": 16, "desc": "🟡 MA5在MA20下方但MA20走平/向上，方向待确认",
+                    "ma_bull": False, "data_ok": True, "trend_hint": trend_hint}
 
-👉 综合打分：{total_score:.0f}/100
-👉 当下概率预测：
-短线上涨概率：{prob_up:.1f}%
-短线下跌概率：{prob_down:.1f}%
-震荡横盘概率：{prob_side:.1f}%
 
-{suggest}
-【数据支撑理由】
-{reason_text}
+# =============================================================================
+# 3. 成交量分析（最新一根 vs 历史平均，尺度不变）
+# =============================================================================
+def analyze_vol(vol_area):
+    w = vol_area.shape[1]
+    hist_end = int(w * 0.90)                 # 左侧90% 历史
+    his = vol_area[:, :hist_end]
+    now = vol_area[:, hist_end:]
+    hsv_h = cv2.cvtColor(his, cv2.COLOR_BGR2HSV)
+    mask_his = preprocess_mask(cv2.inRange(hsv_h, np.array(COLOR_HSV["vol_bar"]["low"]),
+                                           np.array(COLOR_HSV["vol_bar"]["high"])))
+    hsv_n = cv2.cvtColor(now, cv2.COLOR_BGR2HSV)
+    mask_now = preprocess_mask(cv2.inRange(hsv_n, np.array(COLOR_HSV["vol_bar"]["low"]),
+                                           np.array(COLOR_HSV["vol_bar"]["high"])))
+    his_density = cv2.countNonZero(mask_his) / max(1, hist_end)      # 每列平均像素密度
+    now_density = cv2.countNonZero(mask_now) / max(1, now.shape[1])
+    ratio = now_density / his_density if his_density > 0 else 0.0
 
-====================风控提醒====================
-1. 1分钟周期信号变化极快，信号随时失效，每一笔单子必须带止损。
-2. 本程序是截图图像识别，存在颜色识别误差，不能替代行情原始数据。
-3. 期货杠杆高，行情会受外盘、消息、资金冲击，技术信号经常失效。
+    if ratio >= 1.45:
+        return {"score": SCORE_WEIGHT["vol"], "desc": "✅ 最新K线显著放量，资金确认",
+                "vol_strong": True, "ratio": ratio}
+    elif ratio >= 1.1:
+        return {"score": int(SCORE_WEIGHT["vol"] * 0.88), "desc": "✅ 最新K线放量",
+                "vol_strong": True, "ratio": ratio}
+    elif ratio >= 0.72:
+        return {"score": int(SCORE_WEIGHT["vol"] * 0.6), "desc": "🟡 成交量与近期基本持平",
+                "vol_strong": False, "ratio": ratio}
+    else:
+        return {"score": 8, "desc": "❌ 最新K线成交量萎缩，反弹/下跌缺资金",
+                "vol_strong": False, "ratio": ratio}
 
-⚠️免责声明：图像识别技术分析仅为学习研究用途，**不构成任何交易建议**。期货交易风险巨大，盈亏全部由交易者自行承担。
-"""
-    return report, img_draw
+
+# =============================================================================
+# 4. MACD 分析（红绿柱方向 + 0轴 + 柱体动量）
+# =============================================================================
+def analyze_macd(macd_area):
+    w = macd_area.shape[1]
+    right_start = int(w * 0.55)              # 右侧45% 最近柱区
+    region = macd_area[:, right_start:]
+    hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+    mred = preprocess_mask(_mask_red(hsv))
+    mgreen = preprocess_mask(cv2.inRange(hsv, np.array(COLOR_HSV["macd_green"]["low"]),
+                                         np.array(COLOR_HSV["macd_green"]["high"])))
+    # 形态学开运算消除细小噪点
+    kernel = np.ones((2, 2), np.uint8)
+    mred = cv2.morphologyEx(mred, cv2.MORPH_OPEN, kernel)
+    mgreen = cv2.morphologyEx(mgreen, cv2.MORPH_OPEN, kernel)
+
+    red_heights, green_heights = [], []
+    for x in range(region.shape[1]):
+        e = _col_extent(mred[:, x])
+        if e:
+            red_heights.append(e[2])
+        e = _col_extent(mgreen[:, x])
+        if e:
+            green_heights.append(e[2])
+
+    red_sum = sum(red_heights)
+    green_sum = sum(green_heights)
+    if red_sum == 0 and green_sum == 0:
+        return {"score": 10, "desc": "⚠️ 未识别到MACD柱信号，无法判断",
+                "macd_bull": False, "data_ok": False}
+
+    red_dom = red_sum >= green_sum
+    # 柱体动量：对比每侧后半段与前半段的平均高度（0轴由柱色隐含）
+    def _momentum(heights):
+        if len(heights) < 2:
+            return None
+        half = len(heights) // 2
+        head = np.mean(heights[:half]) if half > 0 else 0
+        tail = np.mean(heights[half:]) if half < len(heights) else np.mean(heights)
+        return tail >= head
+
+    mom_red = _momentum(red_heights)
+    mom_green = _momentum(green_heights)
+
+    # DIF/DEA 相对0轴：红柱在0轴上方、绿柱在0轴下方，直接用柱色判断环境
+    if red_dom:
+        if mom_red is False:                       # 红柱但动能在减弱
+            return {"score": 28, "desc": "🟡 MACD红柱占优但动能在减弱，注意钝化",
+                    "macd_bull": True, "data_ok": True}
+        return {"score": SCORE_WEIGHT["macd"], "desc": "✅ MACD红柱占优且动能向上，多头动量",
+                "macd_bull": True, "data_ok": True}
+    else:
+        if mom_green is False:                     # 绿柱但动能在减弱 → 杀跌衰竭
+            return {"score": 12, "desc": "🟡 MACD绿柱占优但动能在衰减，杀跌临近衰竭",
+                    "macd_bull": False, "data_ok": True}
+        return {"score": 8, "desc": "❌ MACD绿柱占优，下跌动量延续",
+                "macd_bull": False, "data_ok": True}
+
+
+# =============================================================================
+# 5. 趋势动量（基于均线斜率，颜色干净、可靠；不再依赖脆弱的蜡烛位置）
+# =============================================================================
+def analyze_trend(ma):
+    hint = ma.get("trend_hint", "flat")
+    m = SCORE_WEIGHT["trend"]
+    if hint == "up":
+        return {"score": m, "desc": "✅ 均线向上延伸，短期上涨动量强", "data_ok": True}
+    if hint == "weak_up":
+        return {"score": int(m * 0.6), "desc": "🟢 均线温和向上，偏多", "data_ok": True}
+    if hint == "down":
+        return {"score": -m, "desc": "❌ 均线向下延伸，短期下跌动量强", "data_ok": True}
+    if hint == "weak_down":
+        return {"score": -int(m * 0.6), "desc": "🔴 均线温和向下，偏空", "data_ok": True}
+    return {"score": 0, "desc": "🟡 均线走平，趋势方向不明", "data_ok": True}
+
+
+# =============================================================================
+# 6. 压力/支撑位（基于近期K线高低点）
+# =============================================================================
+def analyze_levels(k_list, main_h):
+    if len(k_list) < 5:
+        return {"resist_score": 0, "support_score": 0, "desc": "K线不足无法评估压力/支撑"}
+    ys = [k["y"] for k in k_list]
+    recent = ys[-12:] if len(ys) >= 12 else ys
+    recent_high_y = min(recent)          # 顶部=最高价
+    recent_low_y = max(recent)           # 底部=最低价
+    cur = ys[-1]
+    rng = recent_low_y - recent_high_y
+    resist_score, support_score = 0, 0
+    desc = "✅ 价格位于近期区间中段，压力/支撑均衡"
+    if rng > 0:
+        dist_high = (cur - recent_high_y) / rng
+        dist_low = (recent_low_y - cur) / rng
+        if dist_high < 0.18:
+            resist_score = SCORE_WEIGHT["resist"]
+            desc = "🔴 价格贴近近期高点压力位，追多风险大"
+        elif dist_high < 0.36:
+            resist_score = SCORE_WEIGHT["resist"] // 2
+            desc = "🟠 价格接近上方压力位，注意承压"
+        if dist_low < 0.15:
+            support_score = SCORE_WEIGHT["support"]
+            desc = "🟢 价格贴近近期低点支撑位，存在反弹机会"
+    return {"resist_score": resist_score, "support_score": support_score, "desc": desc}
+
+
+# =============================================================================
+# 7. 最后一根K线：影线 + 十字星形态
+# =============================================================================
+def analyze_last_shape(main_area, k_list):
+    if not k_list:
+        return {"shadow_score": 0, "pattern_score": 0, "desc": "无有效K线，形态未识别"}
+    last = k_list[-1]
+    h_main = main_area.shape[0]
+    x0 = max(0, last["cx"] - 3)
+    x1 = last["cx"] + 4
+    strip = main_area[:, x0:x1]
+    hsv = cv2.cvtColor(strip, cv2.COLOR_BGR2HSV)
+    candle = cv2.bitwise_or(_mask_red(hsv),
+                            cv2.inRange(hsv, np.array(COLOR_HSV["k_blue"]["low"]),
+                                        np.array(COLOR_HSV["k_blue"]["high"])))
+    candle = preprocess_mask(candle)
+    kernel = np.ones((2, 2), np.uint8)
+    candle = cv2.morphologyEx(candle, cv2.MORPH_OPEN, kernel)
+    ys = np.where(candle > 0)[0]
+    if len(ys) < 8:
+        return {"shadow_score": 0, "pattern_score": 0, "desc": "K线实体像素不足，形态未识别"}
+
+    ymin, ymax = int(np.min(ys)), int(np.max(ys))
+    full = ymax - ymin
+    p30 = float(np.percentile(ys, 30))
+    p70 = float(np.percentile(ys, 70))
+    body = max(p70 - p30, 1.0)
+    upper = max(p30 - ymin, 0)
+    lower = max(ymax - p70, 0)
+
+    shadow_score, pattern_score = 0, 0
+    tags = []
+    # 长上影：上方影线明显长于实体 → 抛压
+    if body > 8 and upper / body > 2.2:
+        shadow_score = SCORE_WEIGHT["shadow"]
+        tags.append("⚠️ 长上影抛压")
+    else:
+        tags.append("✅ 无长上影压力")
+    # 十字星：实体极短 → 反转预警
+    if body < max(6, h_main * 0.008) and full > body * 3:
+        pattern_score = SCORE_WEIGHT["pattern"]
+        tags.append("⚠️ 十字星，趋势可能反转")
+    else:
+        tags.append("实体正常")
+    return {"shadow_score": shadow_score, "pattern_score": pattern_score,
+            "desc": "，".join(tags)}
+
+
+# =============================================================================
+# 8. 连续同向K线
+# =============================================================================
+def analyze_continue(k_list):
+    if not k_list:
+        return {"score": 0, "desc": "🟡 未检测到有效K线实体"}
+    last_red = k_list[-1]["is_red"]
+    cnt = 0
+    for k in reversed(k_list):
+        if k["is_red"] == last_red:
+            cnt += 1
+        else:
+            break
+    if last_red:
+        if cnt >= 3:
+            return {"score": SCORE_WEIGHT["continue_k"], "desc": f"✅ 连续{cnt}根阳线，短线多头延续"}
+        return {"score": 0, "desc": f"🟡 末尾{cnt}根阳线，不足3根无连续多头"}
+    else:
+        if cnt >= 3:
+            return {"score": -SCORE_WEIGHT["continue_k"], "desc": f"❌ 连续{cnt}根阴线，短线空头延续"}
+        return {"score": 0, "desc": f"🟡 末尾{cnt}根阴线，不足3根无连续空头"}
+
+
+# =============================================================================
+# 9. 综合得分 → 概率（含动态震荡概率 + 强制决策）
+# =============================================================================
+def compute_prob(total_score):
+    k = PROB_CONFIG["sigmoid_k"]
+    center = PROB_CONFIG["sigmoid_center"]
+    def _sig(x):
+        return 1.0 / (1.0 + np.exp(-k * (x - center)))
+    bull_s = _sig(total_score)
+    bear_s = _sig(100 - total_score)
+    # 由于 sigmoid 对称性，bull_s + bear_s ≈ 1；用置信度推导震荡概率
+    conf = abs(bull_s - bear_s) * 100                      # 0~100，越极端越大
+    side_pct = (100 - conf) * PROB_CONFIG["side_max_ratio"]  # 信号越弱震荡越高
+    remain = 100 - side_pct
+    bull_pct = bull_s / (bull_s + bear_s) * remain
+    bear_pct = bear_s / (bull_s + bear_s) * remain
+    return round(bull_pct, 1), round(bear_pct, 1), round(side_pct, 1)
+
+
+def compute_forced(bull_pct, bear_pct):
+    """若必须开仓：二选一的方向 + 置信度"""
+    total = bull_pct + bear_pct
+    if total <= 0:
+        return {"decision": "买跌", "confidence": 50.0, "note": "信号缺失，按中性处理"}
+    conf = round(max(bull_pct, bear_pct) / total * 100, 1)
+    decision = "买涨" if bull_pct >= bear_pct else "买跌"
+    note = ""
+    if conf < PROB_CONFIG["forced_conf_min"]:
+        note = "⚠️ 两方向概率接近，信号偏弱，若必须开仓请轻仓并设严格止损"
+    elif conf >= 70:
+        note = "🔥 方向信号较明确，可正常仓位配合止损"
+    else:
+        note = "🟡 方向有一定优势，建议半仓试探并严格止损"
+    return {"decision": decision, "confidence": conf, "note": note}
+
+
+def build_action(bull_pct, bear_pct):
+    """综合操作建议：买涨 / 买跌 / 观望"""
+    up_th = PROB_CONFIG["action_up_th"]
+    gap_th = PROB_CONFIG["action_gap_th"]
+    if bull_pct >= up_th and (bull_pct - bear_pct) >= gap_th:
+        return "买涨"
+    if bear_pct >= up_th and (bear_pct - bull_pct) >= gap_th:
+        return "买跌"
+    return "观望"
+
+
+# =============================================================================
+# 10. 主分析入口：结构化结果
+# =============================================================================
+def calc_kline_feature(img_cv):
+    h_full, w_full = img_cv.shape[:2]
+    if h_full <= 10 or w_full <= 10:
+        return {"error": "图片尺寸过小，无法识别K线"}
+
+    main_area = _crop(img_cv, REGION_RATIO["main_top"], REGION_RATIO["main_bottom"])
+    vol_area = _crop(img_cv, REGION_RATIO["vol_top"], REGION_RATIO["vol_bottom"])
+    macd_area = _crop(img_cv, REGION_RATIO["macd_top"], REGION_RATIO["macd_bottom"])
+
+    # ---- K线实体（一次识别，供多处复用） ----
+    k_list = detect_candles(main_area)
+    red_cnt = sum(1 for k in k_list if k["is_red"])
+    blue_cnt = len(k_list) - red_cnt
+    k_red_ratio = round(red_cnt / len(k_list) * 100, 2) if k_list else 0.0
+    k_blue_ratio = round(blue_cnt / len(k_list) * 100, 2) if k_list else 0.0
+
+    # ---- 各指标 ----
+    ma = analyze_ma(main_area)
+    vol = analyze_vol(vol_area)
+    macd = analyze_macd(macd_area)
+    trend = analyze_trend(ma)
+    levels = analyze_levels(k_list, main_area.shape[0])
+    shape = analyze_last_shape(main_area, k_list)
+    cont = analyze_continue(k_list)
+
+    # ---- 止损/入场参考（图像像素，仅供截图定位） ----
+    entry_y = None
+    stop_long_y = None
+    stop_short_y = None
+    if len(k_list) > 0:
+        ys = [k["y"] for k in k_list]
+        recent = ys[-12:] if len(ys) >= 12 else ys
+        recent_high_y = min(recent)
+        recent_low_y = max(recent)
+        price_range = recent_low_y - recent_high_y
+        cur_body_y = k_list[-1]["cy"]
+        entry_y = int(cur_body_y)
+        if price_range > 0:
+            stop_long_y = int(recent_low_y + price_range * 0.05)
+            stop_short_y = int(recent_high_y - price_range * 0.05)
+
+    # ---- 综合得分 ----
+    total_score = (ma["score"] + vol["score"] + macd["score"] + trend["score"]
+                   + levels["resist_score"] + levels["support_score"]
+                   + shape["shadow_score"] + shape["pattern_score"] + cont["score"])
+    total_score = int(np.clip(total_score, PROB_CONFIG["score_min"], PROB_CONFIG["score_max"]))
+
+    bull_pct, bear_pct, side_pct = compute_prob(total_score)
+    forced = compute_forced(bull_pct, bear_pct)
+    action = build_action(bull_pct, bear_pct)
+
+    # ---- 结构化输出 ----
+    rows = [
+        {"name": "MA均线",   "desc": ma["desc"],      "score": ma["score"],   "max": SCORE_WEIGHT["ma"], "tag": ""},
+        {"name": "成交量",   "desc": vol["desc"],     "score": vol["score"],  "max": SCORE_WEIGHT["vol"], "tag": ""},
+        {"name": "MACD",     "desc": macd["desc"],    "score": macd["score"], "max": SCORE_WEIGHT["macd"], "tag": ""},
+        {"name": "趋势动量", "desc": trend["desc"],   "score": trend["score"],"max": SCORE_WEIGHT["trend"], "tag": ""},
+        {"name": "压力支撑", "desc": levels["desc"],  "score": levels["resist_score"] + levels["support_score"], "max": SCORE_WEIGHT["support"], "tag": "估算"},
+        {"name": "影线形态", "desc": shape["desc"],   "score": shape["shadow_score"] + shape["pattern_score"], "max": 0, "tag": "估算"},
+        {"name": "连续K线",  "desc": cont["desc"],    "score": cont["score"],"max": SCORE_WEIGHT["continue_k"], "tag": "估算"},
+        {"name": "K线多空",  "desc": f"阳线占{k_red_ratio}% / 阴线占{k_blue_ratio}% (识别{len(k_list)}根)", "score": 0, "max": 0, "tag": "估算"},
+    ]
+
+    # 数据可信度：主干信号(MA/MACD/量)是否有效
+    reliable_ok = sum(1 for s in [ma.get("data_ok"), macd.get("data_ok"), vol.get("data_ok")] if s)
+    if reliable_ok >= 2:
+        data_conf = "较高"
+    elif reliable_ok == 1:
+        data_conf = "一般"
+    else:
+        data_conf = "较低"
+    if not k_list:
+        k_note = "（未能识别到K线实体，红蓝/影线/支撑为估算）"
+    elif len(k_list) < 8:
+        k_note = f"（K线识别数量偏少:{len(k_list)}根，红蓝/影线/支撑仅供参考）"
+    else:
+        k_note = ""
+
+    reasons = []
+    reasons.append(f"综合得分 {total_score}/100，上涨概率 {bull_pct}%，下跌概率 {bear_pct}%，震荡 {side_pct}%。数据可信度：{data_conf}。")
+    # 信号一致性（如实反映，不虚构共振）
+    ma_b = ma.get("ma_bull")
+    macd_b = macd.get("macd_bull")
+    if ma_b is True and macd_b is True:
+        reasons.append("信号一致：均线多头 + MACD多头 共振，做多信号较可靠。")
+    elif ma_b is False and macd_b is False:
+        reasons.append("信号一致：均线空头 + MACD空头 共振，做空信号较可靠。")
+    else:
+        reasons.append("信号分歧：均线与MACD方向不一致，以综合概率为准，胜率打折。")
+    if action == "买涨":
+        reasons.append("综合概率偏多，若选择进场请轻仓试探，并在跌破近期低点或MA5下穿MA20时离场。")
+    elif action == "买跌":
+        reasons.append("综合概率偏空，若选择进场请轻仓试探，并在突破近期高点或MA5上穿MA20时离场。")
+    else:
+        reasons.append("当前信号矛盾、概率接近，属于低胜率区，建议观望等待。")
+    reasons.append("1分钟周期信号变化极快，任何一笔都必须带止损，禁止扛单。")
+
+    # 强制决策的入场/止损/目标（图像像素参考）
+    forced["entry_ref"] = entry_y
+    forced["stop_long_ref"] = stop_long_y
+    forced["stop_short_ref"] = stop_short_y
+
+    result = {
+        "rows": rows,
+        "total_score": total_score,
+        "prob_up": bull_pct,
+        "prob_down": bear_pct,
+        "prob_side": side_pct,
+        "action": action,
+        "reasons": reasons,
+        "data_conf": data_conf,
+        "k_note": k_note,
+        "forced": forced,
+        "entry_y": entry_y,
+        "stop_long_y": stop_long_y,
+        "stop_short_y": stop_short_y,
+        "k_red_ratio": k_red_ratio,
+        "k_blue_ratio": k_blue_ratio,
+        "k_count": len(k_list),
+    }
+    return result
+
+
+# =============================================================================
+# 11. 绘图（止损线标注，纯可视化）
+# =============================================================================
+def draw_mark_image(src_img, feat):
+    draw_img = src_img.copy()
+    if "error" in feat:
+        return draw_img
+    h, w = draw_img.shape[:2]
+    # 止损参考Y换算回整图坐标：主图区域相对整图从 REGION_RATIO['main_top'] 开始
+    main_top = REGION_RATIO["main_top"]
+    main_bottom = REGION_RATIO["main_bottom"]
+    y_src = lambda yy: int(main_top * h + yy / (main_bottom - main_top) * (main_bottom * h - main_top * h)) \
+        if yy is not None else None
+    slong = y_src(feat.get("stop_long_y"))
+    sshort = y_src(feat.get("stop_short_y"))
+    if slong is not None and 0 <= slong < h:
+        cv2.line(draw_img, (0, slong), (w, slong), DRAW_COLOR["stop_long"], 2)
+        cv2.putText(draw_img, "做多止损", (20, slong - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    DRAW_COLOR["stop_long"], 2)
+    if sshort is not None and 0 <= sshort < h:
+        cv2.line(draw_img, (0, sshort), (w, sshort), DRAW_COLOR["stop_short"], 2)
+        cv2.putText(draw_img, "做空止损", (20, sshort + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    DRAW_COLOR["stop_short"], 2)
+    return draw_img
+
+
+# =============================================================================
+# 12. 对外统一入口
+# =============================================================================
+def analyze_kline_image(img_cv):
+    feat = calc_kline_feature(img_cv)
+    draw_img = draw_mark_image(img_cv, feat)
+    return feat, draw_img
